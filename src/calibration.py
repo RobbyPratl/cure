@@ -7,7 +7,10 @@ Frequency-resolved calibration is the KEY NOVEL CONTRIBUTION of CURE.
 import torch
 import numpy as np
 from typing import Tuple, Optional
-from .frequency import FrequencyBands
+try:
+    from .frequency import FrequencyBands
+except ImportError:
+    from frequency import FrequencyBands
 
 
 def compute_ece(

@@ -8,7 +8,10 @@ under Gaussian assumptions.
 import torch
 import numpy as np
 from typing import Tuple, Optional
-from .degradations import get_kernel_frequency_response
+try:
+    from .degradations import get_kernel_frequency_response
+except ImportError:
+    from degradations import get_kernel_frequency_response
 
 
 class WienerFilter:
@@ -143,7 +146,10 @@ class WienerFilter:
 
 def test_wiener():
     """Test Wiener filter implementation."""
-    from .degradations import create_gaussian_kernel, degrade_image
+    try:
+        from .degradations import create_gaussian_kernel, degrade_image
+    except ImportError:
+        from degradations import create_gaussian_kernel, degrade_image
     
     print("Testing wiener.py...")
     
