@@ -32,7 +32,8 @@ class WienerFilter:
         kernel: torch.Tensor,
         noise_sigma: float,
         image_shape: Tuple[int, int],
-        prior_type: str = 'empirical'
+        prior_type: str = 'empirical',
+        signal_power: float = 0.1
     ):
         """
         Args:
@@ -40,21 +41,23 @@ class WienerFilter:
             noise_sigma: Noise standard deviation σ
             image_shape: (H, W)
             prior_type: 'empirical' (1/f² natural image) or 'flat'
+            signal_power: Approximate signal variance (power) for prior scaling
         """
         self.noise_sigma = noise_sigma
         self.noise_var = noise_sigma ** 2
         self.image_shape = image_shape
+        self.signal_power = signal_power
         H, W = image_shape
         
         # Blur frequency response
         self.H_freq = self._kernel_to_freq(kernel, image_shape)
         self.H_mag_sq = torch.abs(self.H_freq) ** 2
         
-        # Prior PSD
+        # Prior PSD - scale to represent actual signal power
         if prior_type == 'empirical':
-            self.prior_psd = self._natural_image_prior(image_shape)
+            self.prior_psd = self._natural_image_prior(image_shape) * signal_power
         else:
-            self.prior_psd = torch.ones(H, W)
+            self.prior_psd = torch.ones(H, W) * signal_power
         
         # Wiener filter: W(f) = H*(f)·Sx(f) / [|H(f)|²·Sx(f) + σ²]
         denom = self.H_mag_sq * self.prior_psd + self.noise_var
@@ -112,6 +115,13 @@ class WienerFilter:
         """
         Draw samples from Gaussian posterior.
         
+        The posterior covariance in frequency domain is diagonal, so we can
+        sample efficiently by adding Gaussian noise scaled by sqrt(variance).
+        
+        For a complex Gaussian with variance σ², we need:
+            real part ~ N(0, σ²/2), imag part ~ N(0, σ²/2)
+        so that |z|² has expected value σ².
+        
         Args:
             degraded: (C, H, W) degraded image
             n_samples: Number of samples
@@ -120,17 +130,23 @@ class WienerFilter:
             samples: (n_samples, C, H, W)
         """
         C, H, W = degraded.shape
-        mean, _, var_freq = self.restore(degraded)
+        mean, _, _ = self.restore(degraded)
+        
+        # Use the posterior variance - ensure it's properly scaled
+        # The variance in frequency domain needs sqrt for std dev
+        std_freq = torch.sqrt(self.posterior_var_freq.clamp(min=1e-10))
         
         samples = []
         for _ in range(n_samples):
             sample_channels = []
             for c in range(C):
-                # Sample in frequency domain where covariance is diagonal
-                noise_real = torch.randn(H, W) * torch.sqrt(var_freq / 2)
-                noise_imag = torch.randn(H, W) * torch.sqrt(var_freq / 2)
+                # Sample complex noise in frequency domain
+                # For proper complex Gaussian: variance split between real/imag
+                noise_real = torch.randn(H, W) * std_freq / np.sqrt(2)
+                noise_imag = torch.randn(H, W) * std_freq / np.sqrt(2)
                 noise_freq = torch.complex(noise_real, noise_imag)
                 
+                # Add noise to mean in frequency domain
                 mean_freq = torch.fft.fft2(mean[c])
                 sample_freq = mean_freq + noise_freq
                 sample_channels.append(torch.fft.ifft2(sample_freq).real)
