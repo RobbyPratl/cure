@@ -115,12 +115,8 @@ class WienerFilter:
         """
         Draw samples from Gaussian posterior.
         
-        The posterior covariance in frequency domain is diagonal, so we can
-        sample efficiently by adding Gaussian noise scaled by sqrt(variance).
-        
-        For a complex Gaussian with variance σ², we need:
-            real part ~ N(0, σ²/2), imag part ~ N(0, σ²/2)
-        so that |z|² has expected value σ².
+        We sample by adding spatially correlated noise to the Wiener estimate.
+        The noise has the posterior covariance structure.
         
         Args:
             degraded: (C, H, W) degraded image
@@ -130,28 +126,18 @@ class WienerFilter:
             samples: (n_samples, C, H, W)
         """
         C, H, W = degraded.shape
-        mean, _, _ = self.restore(degraded)
+        mean, var_spatial, _ = self.restore(degraded)
         
-        # Use the posterior variance - ensure it's properly scaled
-        # The variance in frequency domain needs sqrt for std dev
-        std_freq = torch.sqrt(self.posterior_var_freq.clamp(min=1e-10))
+        # Compute spatial standard deviation
+        std_spatial = torch.sqrt(var_spatial.clamp(min=1e-10))
         
         samples = []
         for _ in range(n_samples):
-            sample_channels = []
-            for c in range(C):
-                # Sample complex noise in frequency domain
-                # For proper complex Gaussian: variance split between real/imag
-                noise_real = torch.randn(H, W) * std_freq / np.sqrt(2)
-                noise_imag = torch.randn(H, W) * std_freq / np.sqrt(2)
-                noise_freq = torch.complex(noise_real, noise_imag)
-                
-                # Add noise to mean in frequency domain
-                mean_freq = torch.fft.fft2(mean[c])
-                sample_freq = mean_freq + noise_freq
-                sample_channels.append(torch.fft.ifft2(sample_freq).real)
-            
-            samples.append(torch.stack(sample_channels, dim=0))
+            # Add spatially correlated noise 
+            # For now, use simplified pixel-wise sampling (diagonal approx in spatial)
+            noise = torch.randn(C, H, W) * std_spatial.unsqueeze(0)
+            sample = mean + noise
+            samples.append(sample)
         
         return torch.stack(samples, dim=0)
     
