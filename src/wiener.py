@@ -77,14 +77,14 @@ class WienerFilter:
         return torch.fft.fft2(padded)
     
     def _natural_image_prior(self, shape: Tuple[int, int]) -> torch.Tensor:
-        """1/f² prior typical of natural images."""
+        """1/f² prior typical of natural images, normalized so mean = 1."""
         H, W = shape
         fy = torch.fft.fftfreq(H)[:, None]
         fx = torch.fft.fftfreq(W)[None, :]
         freq_mag = torch.sqrt(fx**2 + fy**2)
         freq_mag[0, 0] = 1e-10
         psd = 1.0 / (freq_mag ** 2 + 1e-6)
-        return psd / psd.max()
+        return psd / psd.mean()  # Normalize by mean so signal_power scales average variance
     
     def restore(self, degraded: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -113,14 +113,14 @@ class WienerFilter:
     
     def sample_posterior(self, degraded: torch.Tensor, n_samples: int = 50) -> torch.Tensor:
         """
-        Draw samples from Gaussian posterior.
+        Draw samples from Gaussian posterior in frequency domain.
         
-        The posterior is Gaussian with diagonal covariance in the FREQUENCY domain.
-        So we sample noise in frequency domain, scale by sqrt(posterior_var_freq),
-        then transform back to spatial domain.
+        The Wiener posterior is Gaussian with DIAGONAL covariance in frequency domain:
+            mean(f) = W(f) · Y(f)
+            var(f) = posterior_var_freq
         
-        Key scaling: ifft2 divides by sqrt(H*W), so we must scale up by sqrt(H*W)
-        to preserve variance in spatial domain (Parseval's theorem).
+        Key insight: ifft2 scales variance by 1/(H*W) due to Parseval's theorem.
+        So to get spatial variance V, we need freq variance V * H * W.
         
         Args:
             degraded: (C, H, W) degraded image
@@ -130,28 +130,36 @@ class WienerFilter:
             samples: (n_samples, C, H, W)
         """
         C, H, W = degraded.shape
-        mean, _, var_freq = self.restore(degraded)
+        N = H * W  # Total number of pixels
         
-        # Standard deviation in frequency domain (where covariance is diagonal)
-        std_freq = torch.sqrt(var_freq.clamp(min=1e-10))
-        
-        # Scale factor to preserve variance after ifft2 (Parseval's theorem)
-        scale = np.sqrt(H * W)
+        # Scale factor for frequency variance:
+        # 1. Multiply by N because ifft2 divides by N, squaring to 1/N² for variance
+        # 2. Multiply by 2 because we add non-Hermitian complex noise then take .real,
+        #    which discards the imaginary part and loses half the variance
+        freq_var_scaled = self.posterior_var_freq * N * 2
         
         samples = []
         for _ in range(n_samples):
-            # Sample complex Gaussian noise in frequency domain
-            # Real and imaginary parts each have variance std_freq²/2 
-            # so total variance is std_freq²
-            noise_real = torch.randn(C, H, W) * (std_freq * scale / np.sqrt(2)).unsqueeze(0)
-            noise_imag = torch.randn(C, H, W) * (std_freq * scale / np.sqrt(2)).unsqueeze(0)
-            noise_freq = torch.complex(noise_real, noise_imag)
+            sample_channels = []
+            for c in range(C):
+                # Compute posterior mean in frequency domain
+                Y_freq = torch.fft.fft2(degraded[c])
+                mean_freq = self.W_freq * Y_freq
+                
+                # Sample complex Gaussian noise with scaled variance
+                # For complex Gaussian: var(real) = var(imag) = total_var / 2
+                noise_real = torch.randn(H, W) * torch.sqrt(freq_var_scaled / 2)
+                noise_imag = torch.randn(H, W) * torch.sqrt(freq_var_scaled / 2)
+                noise_freq = torch.complex(noise_real, noise_imag)
+                
+                # Sample = mean + noise in frequency domain
+                sample_freq = mean_freq + noise_freq
+                
+                # Transform back to spatial domain
+                sample_spatial = torch.fft.ifft2(sample_freq).real
+                sample_channels.append(sample_spatial)
             
-            # Transform noise to spatial domain (gives spatially correlated noise)
-            noise_spatial = torch.fft.ifft2(noise_freq).real
-            
-            sample = mean + noise_spatial
-            samples.append(sample)
+            samples.append(torch.stack(sample_channels, dim=0))
         
         return torch.stack(samples, dim=0)
     
