@@ -376,7 +376,8 @@ def degrade_image(
     blur_sigma: float = 2.0,
     noise_sigma: float = 0.05,
     blur_type: str = 'gaussian',
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    clip_noise: bool = True
 ) -> Dict[str, Any]:
     """
     Apply full degradation pipeline: blur then noise.
@@ -421,7 +422,7 @@ def degrade_image(
     blurred = apply_blur(image, kernel, mode='fft')
     
     # Add noise
-    degraded, noise = add_gaussian_noise(blurred, noise_sigma, seed=seed)
+    degraded, noise = add_gaussian_noise(blurred, noise_sigma, seed=seed, clip=clip_noise)
     
     return {
         'degraded': degraded,
