@@ -213,7 +213,8 @@ class WienerFilter:
         means = []
         for c in range(C):
             Y = torch.fft.fft2(degraded[c])
-            X = self.W_freq * Y
+            Wc = self.W_freq[c] if self.per_channel_prior else self.W_freq
+            X = Wc * Y
             means.append(torch.fft.ifft2(X).real)
         mean_spatial = torch.stack(means, dim=0)
         if mean is not None:
