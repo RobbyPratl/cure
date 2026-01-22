@@ -33,7 +33,10 @@ class WienerFilter:
         noise_sigma: float,
         image_shape: Tuple[int, int],
         prior_type: str = 'empirical',
-        signal_power: float = 0.1
+        signal_power: float = 0.1,
+        prior_psd: Optional[torch.Tensor] = None,
+        center_mode: str = 'none',
+        variance_scale: float = 1.0
     ):
         """
         Args:
@@ -42,11 +45,22 @@ class WienerFilter:
             image_shape: (H, W)
             prior_type: 'empirical' (1/f² natural image) or 'flat'
             signal_power: Approximate signal variance (power) for prior scaling
+            prior_psd: Optional PSD override (H, W) or (C, H, W). If provided,
+                this is used directly instead of the analytic prior.
+            center_mode: 'none' or 'channel_mean'. If 'channel_mean', the
+                per-channel spatial mean of the degraded image is subtracted
+                before filtering and added back to the posterior mean.
+            variance_scale: Optional multiplicative calibration factor for
+                posterior variance used in sampling. Default 1.0 (no scaling).
         """
         self.noise_sigma = noise_sigma
         self.noise_var = noise_sigma ** 2
         self.image_shape = image_shape
         self.signal_power = signal_power
+        if center_mode not in {'none', 'channel_mean'}:
+            raise ValueError("center_mode must be 'none' or 'channel_mean'")
+        self.center_mode = center_mode
+        self.variance_scale = float(variance_scale)
         H, W = image_shape
         
         # Blur frequency response
@@ -54,10 +68,17 @@ class WienerFilter:
         self.H_mag_sq = torch.abs(self.H_freq) ** 2
         
         # Prior PSD - scale to represent actual signal power
-        if prior_type == 'empirical':
+        if prior_psd is not None:
+            psd = prior_psd
+            if psd.dim() == 3:
+                psd = psd.mean(dim=0)
+            if psd.shape != (H, W):
+                raise ValueError(f"prior_psd must have shape {(H, W)} or (C, H, W)")
+            self.prior_psd = psd.real.to(self.H_freq.device)
+        elif prior_type == 'empirical':
             self.prior_psd = self._natural_image_prior(image_shape) * signal_power
         else:
-            self.prior_psd = torch.ones(H, W) * signal_power
+            self.prior_psd = torch.ones(H, W, device=self.H_freq.device) * signal_power
         
         # Wiener filter: W(f) = H*(f)·Sx(f) / [|H(f)|²·Sx(f) + σ²]
         denom = self.H_mag_sq * self.prior_psd + self.noise_var
@@ -67,13 +88,27 @@ class WienerFilter:
         self.posterior_var_freq = (self.noise_var * self.prior_psd) / (denom + 1e-10)
     
     def _kernel_to_freq(self, kernel: torch.Tensor, shape: Tuple[int, int]) -> torch.Tensor:
-        """Convert spatial kernel to frequency response."""
+        """Convert spatial kernel to frequency response.
+        
+        For proper FFT alignment, we place the kernel center at the origin (0,0)
+        of the padded array. This is the standard convention for convolution
+        kernels in frequency domain - no ifftshift needed.
+        """
         H, W = shape
         kH, kW = kernel.shape
         padded = torch.zeros(H, W, dtype=torch.float32)
-        sh, sw = (H - kH) // 2, (W - kW) // 2
-        padded[sh:sh+kH, sw:sw+kW] = kernel
-        padded = torch.fft.ifftshift(padded)
+        
+        # Place kernel with its center at origin (0,0) using wrap-around indexing.
+        # For a kernel of size (kH, kW), the center is at (kH//2, kW//2).
+        # We want this center pixel to land at padded[0, 0].
+        center_h, center_w = kH // 2, kW // 2
+        for i in range(kH):
+            for j in range(kW):
+                # Destination indices with wrap-around
+                di = (i - center_h) % H
+                dj = (j - center_w) % W
+                padded[di, dj] = kernel[i, j]
+        
         return torch.fft.fft2(padded)
     
     def _natural_image_prior(self, shape: Tuple[int, int]) -> torch.Tensor:
@@ -99,6 +134,12 @@ class WienerFilter:
             var_freq: (H, W) frequency variance (exact)
         """
         C, H, W = degraded.shape
+
+        if self.center_mode == 'channel_mean':
+            mean = degraded.mean(dim=(1, 2), keepdim=True)
+            degraded = degraded - mean
+        else:
+            mean = None
         
         restored = []
         for c in range(C):
@@ -107,58 +148,94 @@ class WienerFilter:
             restored.append(torch.fft.ifft2(X).real)
         
         restored = torch.stack(restored, dim=0)
-        var_spatial = torch.fft.ifft2(self.posterior_var_freq).real.abs()
+        if mean is not None:
+            restored = restored + mean
+        # For a shift-invariant blur and stationary prior/noise, the posterior
+        # covariance is also stationary. The per-pixel variance is the average
+        # power of the posterior PSD (zero-lag of the autocovariance), which is
+        # simply its mean value.
+        var_scalar = torch.mean(self.posterior_var_freq.real)
+        var_spatial = torch.full((H, W), float(var_scalar))
         
         return restored, var_spatial, self.posterior_var_freq
     
     def sample_posterior(self, degraded: torch.Tensor, n_samples: int = 50) -> torch.Tensor:
         """
-        Draw samples from Gaussian posterior in frequency domain.
+        Draw samples from the exact Gaussian posterior using frequency-domain sampling.
+
+        For a linear-Gaussian model y = Hx + n with stationary prior and noise,
+        the posterior is Gaussian with:
+          - Mean: W(f) * Y(f) in frequency domain
+          - Covariance: stationary with PSD = posterior_var_freq
+
+        The posterior_var_freq is the power spectral density (PSD) of the error.
+        For a stationary process, the spatial variance at any pixel equals the
+        mean of the PSD. To sample correctly in frequency domain:
         
-        The Wiener posterior is Gaussian with DIAGONAL covariance in frequency domain:
-            mean(f) = W(f) · Y(f)
-            var(f) = posterior_var_freq
-        
-        Key insight: ifft2 scales variance by 1/(H*W) due to Parseval's theorem.
-        So to get spatial variance V, we need freq variance V * H * W.
-        
+        1. The PSD tells us E[|X(f)|²] for each frequency
+        2. For fft2 with "backward" normalization (default), irfft2 divides by N=H*W
+        3. So we need to scale the frequency-domain noise by sqrt(H*W) to get
+           the correct spatial variance after irfft2.
+
         Args:
             degraded: (C, H, W) degraded image
             n_samples: Number of samples
-        
+
         Returns:
             samples: (n_samples, C, H, W)
         """
         C, H, W = degraded.shape
-        N = H * W  # Total number of pixels
+        N = H * W
+
+        if self.center_mode == 'channel_mean':
+            mean = degraded.mean(dim=(1, 2), keepdim=True)
+            degraded = degraded - mean
+        else:
+            mean = None
+
+        # Posterior mean per channel in spatial domain
+        means = []
+        for c in range(C):
+            Y = torch.fft.fft2(degraded[c])
+            X = self.W_freq * Y
+            means.append(torch.fft.ifft2(X).real)
+        mean_spatial = torch.stack(means, dim=0)
+        if mean is not None:
+            mean_spatial = mean_spatial + mean
+
+        # For sampling from a stationary Gaussian with PSD S(f):
+        # - Generate complex Gaussian Z(f) with E[|Z(f)|²] = S(f) * N (for fft normalization)
+        # - Apply irfft2 to get spatial samples with correct variance
+        #
+        # Using rfft2/irfft2 for efficiency (handles Hermitian symmetry automatically)
+        var_freq_rfft = (self.posterior_var_freq * self.variance_scale)[:, :W//2 + 1]
         
-        # Scale factor for frequency variance:
-        # 1. Multiply by N because ifft2 divides by N, squaring to 1/N² for variance
-        # 2. Multiply by 2 because we add non-Hermitian complex noise then take .real,
-        #    which discards the imaginary part and loses half the variance
-        freq_var_scaled = self.posterior_var_freq * N * 2
+        # Scale by N for FFT normalization (irfft2 divides by N)
+        std_freq = torch.sqrt(var_freq_rfft.real * N + 1e-12)
         
         samples = []
         for _ in range(n_samples):
             sample_channels = []
             for c in range(C):
-                # Compute posterior mean in frequency domain
-                Y_freq = torch.fft.fft2(degraded[c])
-                mean_freq = self.W_freq * Y_freq
-                
-                # Sample complex Gaussian noise with scaled variance
-                # For complex Gaussian: var(real) = var(imag) = total_var / 2
-                noise_real = torch.randn(H, W) * torch.sqrt(freq_var_scaled / 2)
-                noise_imag = torch.randn(H, W) * torch.sqrt(freq_var_scaled / 2)
+                # Generate complex Gaussian noise in rfft domain
+                # Real and imag parts each have variance var/2 to get total var
+                noise_real = torch.randn(H, W//2 + 1) * (std_freq / np.sqrt(2))
+                noise_imag = torch.randn(H, W//2 + 1) * (std_freq / np.sqrt(2))
                 noise_freq = torch.complex(noise_real, noise_imag)
                 
-                # Sample = mean + noise in frequency domain
-                sample_freq = mean_freq + noise_freq
+                # DC and Nyquist frequencies (if W is even) must be real
+                # These frequencies have no imaginary counterpart, so full variance goes to real
+                noise_freq[0, 0] = noise_freq[0, 0].real * np.sqrt(2)
+                if W % 2 == 0:
+                    noise_freq[0, W//2] = noise_freq[0, W//2].real * np.sqrt(2)
+                if H % 2 == 0:
+                    noise_freq[H//2, 0] = noise_freq[H//2, 0].real * np.sqrt(2)
+                    if W % 2 == 0:
+                        noise_freq[H//2, W//2] = noise_freq[H//2, W//2].real * np.sqrt(2)
                 
-                # Transform back to spatial domain
-                sample_spatial = torch.fft.ifft2(sample_freq).real
-                sample_channels.append(sample_spatial)
-            
+                # Transform to spatial domain
+                noise_spatial = torch.fft.irfft2(noise_freq, s=(H, W))
+                sample_channels.append(mean_spatial[c] + noise_spatial)
             samples.append(torch.stack(sample_channels, dim=0))
         
         return torch.stack(samples, dim=0)
