@@ -376,6 +376,7 @@ def degrade_image(
     blur_sigma: float = 2.0,
     noise_sigma: float = 0.05,
     blur_type: str = 'gaussian',
+    blur_mode: str = 'fft',
     seed: Optional[int] = None,
     clip_noise: bool = True
 ) -> Dict[str, Any]:
@@ -392,6 +393,7 @@ def degrade_image(
             - For 'box': kernel size
         noise_sigma: Additive Gaussian noise standard deviation
         blur_type: 'gaussian', 'motion', or 'box'
+        blur_mode: 'fft', 'reflect', or 'zero' (boundary handling)
         seed: Random seed for reproducibility
     
     Returns:
@@ -419,7 +421,7 @@ def degrade_image(
         raise ValueError(f"Unknown blur_type: {blur_type}")
     
     # Apply blur (FFT mode for consistency with Wiener filter)
-    blurred = apply_blur(image, kernel, mode='fft')
+    blurred = apply_blur(image, kernel, mode=blur_mode)
     
     # Add noise
     degraded, noise = add_gaussian_noise(blurred, noise_sigma, seed=seed, clip=clip_noise)
@@ -433,6 +435,7 @@ def degrade_image(
         'params': {
             'blur_sigma': blur_sigma,
             'blur_type': blur_type,
+            'blur_mode': blur_mode,
             'noise_sigma': noise_sigma,
             'seed': seed,
         }
