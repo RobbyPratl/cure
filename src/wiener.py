@@ -71,21 +71,33 @@ class WienerFilter:
         if prior_psd is not None:
             psd = prior_psd
             if psd.dim() == 3:
-                psd = psd.mean(dim=0)
-            if psd.shape != (H, W):
-                raise ValueError(f"prior_psd must have shape {(H, W)} or (C, H, W)")
-            self.prior_psd = psd.real.to(self.H_freq.device)
+                if psd.shape[1:] != (H, W):
+                    raise ValueError(f"prior_psd must have shape (C, {H}, {W})")
+                self.prior_psd = psd.real.to(self.H_freq.device)
+            else:
+                if psd.shape != (H, W):
+                    raise ValueError(f"prior_psd must have shape {(H, W)} or (C, H, W)")
+                self.prior_psd = psd.real.to(self.H_freq.device)
         elif prior_type == 'empirical':
             self.prior_psd = self._natural_image_prior(image_shape) * signal_power
         else:
             self.prior_psd = torch.ones(H, W, device=self.H_freq.device) * signal_power
+
+        self.per_channel_prior = (self.prior_psd.dim() == 3)
         
         # Wiener filter: W(f) = H*(f)·Sx(f) / [|H(f)|²·Sx(f) + σ²]
-        denom = self.H_mag_sq * self.prior_psd + self.noise_var
-        self.W_freq = torch.conj(self.H_freq) * self.prior_psd / (denom + 1e-10)
-        
-        # Posterior variance: Σ(f) = σ²·Sx(f) / [σ² + |H(f)|²·Sx(f)]
-        self.posterior_var_freq = (self.noise_var * self.prior_psd) / (denom + 1e-10)
+        if self.per_channel_prior:
+            H_mag_sq = self.H_mag_sq.unsqueeze(0)
+            H_freq = self.H_freq.unsqueeze(0)
+            denom = H_mag_sq * self.prior_psd + self.noise_var
+            self.W_freq = torch.conj(H_freq) * self.prior_psd / (denom + 1e-10)
+            # Posterior variance: Σ(f) = σ²·Sx(f) / [σ² + |H(f)|²·Sx(f)]
+            self.posterior_var_freq = (self.noise_var * self.prior_psd) / (denom + 1e-10)
+        else:
+            denom = self.H_mag_sq * self.prior_psd + self.noise_var
+            self.W_freq = torch.conj(self.H_freq) * self.prior_psd / (denom + 1e-10)
+            # Posterior variance: Σ(f) = σ²·Sx(f) / [σ² + |H(f)|²·Sx(f)]
+            self.posterior_var_freq = (self.noise_var * self.prior_psd) / (denom + 1e-10)
     
     def _kernel_to_freq(self, kernel: torch.Tensor, shape: Tuple[int, int]) -> torch.Tensor:
         """Convert spatial kernel to frequency response.
@@ -144,7 +156,8 @@ class WienerFilter:
         restored = []
         for c in range(C):
             Y = torch.fft.fft2(degraded[c])
-            X = self.W_freq * Y
+            Wc = self.W_freq[c] if self.per_channel_prior else self.W_freq
+            X = Wc * Y
             restored.append(torch.fft.ifft2(X).real)
         
         restored = torch.stack(restored, dim=0)
@@ -154,10 +167,13 @@ class WienerFilter:
         # covariance is also stationary. The per-pixel variance is the average
         # power of the posterior PSD (zero-lag of the autocovariance), which is
         # simply its mean value.
-        var_scalar = torch.mean(self.posterior_var_freq.real)
+        posterior_var = self.posterior_var_freq
+        if posterior_var.dim() == 3:
+            posterior_var = posterior_var.mean(dim=0)
+        var_scalar = torch.mean(posterior_var.real)
         var_spatial = torch.full((H, W), float(var_scalar))
         
-        return restored, var_spatial, self.posterior_var_freq
+        return restored, var_spatial, posterior_var
     
     def sample_posterior(self, degraded: torch.Tensor, n_samples: int = 50) -> torch.Tensor:
         """
@@ -208,7 +224,11 @@ class WienerFilter:
         # - Apply irfft2 to get spatial samples with correct variance
         #
         # Using rfft2/irfft2 for efficiency (handles Hermitian symmetry automatically)
-        var_freq_rfft = (self.posterior_var_freq * self.variance_scale)[:, :W//2 + 1]
+        posterior_var = self.posterior_var_freq * self.variance_scale
+        if posterior_var.dim() == 3:
+            var_freq_rfft = posterior_var[:, :, :W//2 + 1]
+        else:
+            var_freq_rfft = posterior_var[:, :W//2 + 1]
         
         # Scale by N for FFT normalization (irfft2 divides by N)
         std_freq = torch.sqrt(var_freq_rfft.real * N + 1e-12)
@@ -219,8 +239,9 @@ class WienerFilter:
             for c in range(C):
                 # Generate complex Gaussian noise in rfft domain
                 # Real and imag parts each have variance var/2 to get total var
-                noise_real = torch.randn(H, W//2 + 1) * (std_freq / np.sqrt(2))
-                noise_imag = torch.randn(H, W//2 + 1) * (std_freq / np.sqrt(2))
+                std_f = std_freq[c] if std_freq.dim() == 3 else std_freq
+                noise_real = torch.randn(H, W//2 + 1) * (std_f / np.sqrt(2))
+                noise_imag = torch.randn(H, W//2 + 1) * (std_f / np.sqrt(2))
                 noise_freq = torch.complex(noise_real, noise_imag)
                 
                 # DC and Nyquist frequencies (if W is even) must be real
@@ -242,6 +263,8 @@ class WienerFilter:
     
     def get_snr_per_frequency(self) -> torch.Tensor:
         """SNR(f) = |H(f)|²·Sx(f) / σ²"""
+        if self.per_channel_prior:
+            return self.H_mag_sq.unsqueeze(0) * self.prior_psd / self.noise_var
         return self.H_mag_sq * self.prior_psd / self.noise_var
 
 
